@@ -1,7 +1,6 @@
 name: Phoenix Firmware Dumper & Release
 
 on:
-  # Manual trigger with inputs
   workflow_dispatch:
     inputs:
       firmware_url:
@@ -20,14 +19,6 @@ on:
         description: 'Firmware version/tag'
         required: true
         default: 'Hot-10i-04'
-  
-  # Or trigger on push (optional)
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - '**.md'
-      - '.github/**'
 
 env:
   FIRMWARE_URL: ${{ github.event.inputs.firmware_url || 'https://archive.org/download/infinix-hot-10i-x-659-b-04/Infinix-Hot-10i-X659B-04.zip' }}
@@ -37,124 +28,126 @@ env:
 
 jobs:
   dump-and-release:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120  # 2 hours for large firmware
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
     
     steps:
-      # Step 1: Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
       
-      # Step 2: Setup environment and dependencies
-      - name: Setup Phoenix Firmware Dumper dependencies
+      - name: Setup dependencies
         run: |
-          echo "Installing dependencies..."
+          echo "Installing system dependencies..."
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            python3 python3-pip python3-setuptools \
+            python3 python3-pip python3-setuptools python3-venv \
             git curl wget aria2 \
-            unzip p7zip-full \
+            unzip p7zip-full p7zip-rar \
             liblz4-tool brotli \
             android-sdk-libsparse-utils \
             libxml2-utils \
-            jq bc
+            jq bc file \
+            cpio gzip bzip2 xz-utils \
+            zstd
           
-          # Install Python packages
+          echo "Installing Python packages from PyPI only..."
+          pip3 install --user --upgrade pip
           pip3 install --user \
-            protobuf \
+            protobuf==3.20.3 \
             bsdiff4 \
             six \
             docopt \
-            git+https://github.com/python-protobuf/python-protobuf.git \
-            git+https://github.com/sebastianludwig/brotlipython.git \
             pycryptodome \
-            zstandard
+            zstandard \
+            lz4 \
+            brotli
+          
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          pip3 list --user
       
-      # Step 3: Clone Phoenix Firmware Dumper
       - name: Clone Phoenix Firmware Dumper
         run: |
           git clone --depth=1 https://github.com/DroidDumps/phoenix_firmware_dumper.git phoenix
           cd phoenix
           chmod +x dumper.sh setup.sh
-          ls -la
       
-      # Step 4: Run setup script
       - name: Run Phoenix setup
         run: |
           cd phoenix
+          # Run setup but ignore pip errors (we already installed deps)
           bash setup.sh || echo "Setup completed with warnings"
       
-      # Step 5: Download and dump firmware
+      - name: Download firmware
+        run: |
+          mkdir -p firmware
+          cd firmware
+          echo "Downloading from: ${{ env.FIRMWARE_URL }}"
+          
+          # Try aria2c first, fallback to wget/curl
+          aria2c -x4 -s4 -c -o firmware.zip '${{ env.FIRMWARE_URL }}' 2>/dev/null || \
+            wget -q --show-progress -c -O firmware.zip '${{ env.FIRMWARE_URL }}' || \
+            curl -L -o firmware.zip '${{ env.FIRMWARE_URL }}'
+          
+          ls -lh firmware.zip
+          echo "firmware_path=$(pwd)/firmware.zip" >> $GITHUB_ENV
+      
       - name: Dump firmware with Phoenix
         id: dump
         run: |
           cd phoenix
+          echo "Starting dump for ${{ env.BRAND }} ${{ env.DEVICE_CODENAME }}"
           
-          echo "Starting firmware dump..."
-          echo "URL: ${{ env.FIRMWARE_URL }}"
-          echo "Device: ${{ env.BRAND }} ${{ env.DEVICE_CODENAME }}"
+          # Run dumper
+          bash dumper.sh '${{ env.firmware_path }}' 2>&1 | tee dump.log || {
+            echo "Dumper exited with code ${PIPESTATUS[0]}"
+          }
           
-          # Create output directory
-          mkdir -p out
-          
-          # Run dumper with URL
-          bash dumper.sh '${{ env.FIRMWARE_URL }}' 2>&1 | tee dump.log
-          
-          # Find output directory (Phoenix creates timestamped folders)
-          OUTPUT_DIR=$(find out -maxdepth 1 -type d -name "*${{ env.DEVICE_CODENAME }}*" | head -n 1)
+          # Find output directory
+          OUTPUT_DIR=$(find out -maxdepth 1 -type d | grep -v "^out$" | sort -r | head -n 1)
           
           if [ -z "$OUTPUT_DIR" ]; then
-            # Try to find any recent output directory
-            OUTPUT_DIR=$(ls -td out/*/ 2>/dev/null | head -n 1)
+            OUTPUT_DIR=$(find . -maxdepth 2 -type d -name "*${{ env.DEVICE_CODENAME }}*" 2>/dev/null | head -n 1)
           fi
           
           if [ -z "$OUTPUT_DIR" ] || [ ! -d "$OUTPUT_DIR" ]; then
-            echo "Error: Could not find output directory"
-            ls -la out/ || true
+            echo "Error: No output found"
+            ls -la out/ 2>/dev/null || true
             exit 1
           fi
           
-          echo "Output directory found: $OUTPUT_DIR"
           echo "output_dir=$OUTPUT_DIR" >> $GITHUB_OUTPUT
-          
-          # List contents for debugging
-          echo "Dump contents:"
-          find "$OUTPUT_DIR" -type f | head -50
-          
-          # Calculate total size
-          TOTAL_SIZE=$(du -sh "$OUTPUT_DIR" | cut -f1)
-          echo "total_size=$TOTAL_SIZE" >> $GITHUB_OUTPUT
+          echo "total_size=$(du -sh $OUTPUT_DIR | cut -f1)" >> $GITHUB_OUTPUT
+          find "$OUTPUT_DIR" -type f | head -20
       
-      # Step 6: Create archive of dump
       - name: Create release archive
         id: archive
         run: |
-          cd phoenix
           OUTPUT_DIR="${{ steps.dump.outputs.output_dir }}"
           ARCHIVE_NAME="${{ env.BRAND }}_${{ env.DEVICE_CODENAME }}_${{ env.FIRMWARE_VERSION }}_dump.tar.gz"
           
-          echo "Creating archive: $ARCHIVE_NAME"
-          
-          # Create compressed archive
+          echo "Creating $ARCHIVE_NAME from $OUTPUT_DIR"
           tar -czf "$ARCHIVE_NAME" -C "$(dirname "$OUTPUT_DIR")" "$(basename "$OUTPUT_DIR")"
           
-          # Calculate archive size
-          ARCHIVE_SIZE=$(du -h "$ARCHIVE_NAME" | cut -f1)
-          echo "Archive size: $ARCHIVE_SIZE"
+          ARCHIVE_BYTES=$(stat -c%s "$ARCHIVE_NAME" 2>/dev/null || echo "0")
+          echo "Size: $(du -h $ARCHIVE_NAME | cut -f1) ($ARCHIVE_BYTES bytes)"
+          
+          # Split if >2GB
+          if [ "$ARCHIVE_BYTES" -gt 2147483648 ]; then
+            echo "File too large, splitting..."
+            split -b 1900M "$ARCHIVE_NAME" "${ARCHIVE_NAME}.part"
+          fi
           
           echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
-          echo "archive_path=phoenix/$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+          echo "archive_path=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
       
-      # Step 7: Upload artifact (backup)
-      - name: Upload artifact to GitHub
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BRAND }}-${{ env.DEVICE_CODENAME }}-dump
-          path: ${{ steps.archive.outputs.archive_path }}
+          path: ${{ steps.archive.outputs.archive_path }}*
           retention-days: 30
-          compression-level: 0  # Already compressed
+          compression-level: 0
       
-      # Step 8: Create GitHub Release
       - name: Create GitHub Release
         id: create_release
         uses: softprops/action-gh-release@v1
@@ -169,49 +162,23 @@ jobs:
             | **Brand** | ${{ env.BRAND }} |
             | **Device** | ${{ env.DEVICE_CODENAME }} |
             | **Version** | ${{ env.FIRMWARE_VERSION }} |
-            | **Platform** | MT6768 (from scatter file) |
+            | **Platform** | MT6768 |
             | **Dump Size** | ${{ steps.dump.outputs.total_size }} |
-            | **Archive Size** | See release assets |
             
             ### Contents
-            This release contains the complete firmware dump including:
             - Boot images (boot_a, boot_b)
             - DTB/Dtbo images
             - Super partition (system, vendor, product)
-            - Preloader
-            - Modem/firmware (md1img)
-            - TEE/TrustZone images
-            - Vendor boot
-            - VBMeta images
+            - Preloader, Modem, TEE images
+            - VBMeta, Vendor boot
             
             ### Source
-            - **Original URL:** ${{ env.FIRMWARE_URL }}
-            - **Dumped by:** Phoenix Firmware Dumper [^5^]
+            - **URL:** ${{ env.FIRMWARE_URL }}
+            - **Tool:** Phoenix Firmware Dumper
             
-            ### Notes
-            - A/B partition scheme device
-            - Dynamic partitions (super.img)
-            - Scatter file: MT6768_Android_scatter.txt
-            
-          files: |
-            ${{ steps.archive.outputs.archive_path }}
-          draft: false
-          prerelease: false
+            - A/B partitions, Dynamic partitions
+          files: ${{ steps.archive.outputs.archive_path }}*
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
-      # Step 9: Summary
-      - name: Job Summary
-        run: |
-          echo "## ✅ Firmware Dump Complete!" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Detail | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Device | ${{ env.BRAND }} ${{ env.DEVICE_CODENAME }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Version | ${{ env.FIRMWARE_VERSION }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Total Size | ${{ steps.dump.outputs.total_size }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Archive | ${{ steps.archive.outputs.archive_name }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Release" >> $GITHUB_STEP_SUMMARY
-          echo "🔗 ${{ steps.create_release.outputs.url }}" >> $GITHUB_STEP_SUMMARY
           
