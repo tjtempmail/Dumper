@@ -35,7 +35,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
@@ -43,14 +43,28 @@ jobs:
             simg2img e2fsprogs \
             liblz4-tool brotli \
             git curl file zstd
-          
-          # Download lpunpack from reliable source
+      
+      - name: Download lpunpack tool
+        run: |
           mkdir -p ~/bin
           cd ~/bin
-          wget -q https://github.com/northumber/android-partition-tools_prebuilt_binaries/releases/download/v1.0/lpunpack-arm64-v8a -O lpunpack || \
-          wget -q https://raw.githubusercontent.com/HemanthJabalpuri/AndroidExplorer/master/lpunpack.py -O lpunpack.py
-          chmod +x *
+          
+          # Try multiple sources for lpunpack
+          echo "Downloading lpunpack..."
+          
+          # Option 1: Prebuilt binary
+          wget -q https://github.com/northumber/android-partition-tools_prebuilt_binaries/releases/download/v1.0/lpunpack-arm64-v8a -O lpunpack 2>/dev/null || \
+          # Option 2: Python script
+          wget -q https://raw.githubusercontent.com/HemanthJabalpuri/AndroidExplorer/master/lpunpack.py -O lpunpack.py 2>/dev/null || \
+          # Option 3: Build from AOSP
+          (git clone --depth=1 https://android.googlesource.com/platform/system/extras lpunpack_src 2>/dev/null && \
+           cd lpunpack_src/partition_tools && gcc -o lpunpack lpunpack.c 2>/dev/null) || \
+          echo "WARNING: Could not download lpunpack, will use alternative methods"
+          
+          chmod +x * 2>/dev/null || true
+          ls -la ~/bin/ || echo "bin directory empty"
           echo "$HOME/bin" >> $GITHUB_PATH
+        continue-on-error: true
       
       - name: Clone Phoenix
         run: |
@@ -61,12 +75,20 @@ jobs:
       - name: Download firmware with aria2
         run: |
           mkdir -p firmware && cd firmware
+          echo "Downloading firmware..."
           aria2c -x16 -s16 -c -o firmware.zip '${{ env.FIRMWARE_URL }}'
+          
           ls -lh firmware.zip
           file firmware.zip
+          
+          # Verify it's actually a zip
+          if ! unzip -t firmware.zip 2>&1 | head -5; then
+            echo "WARNING: ZIP test failed, file may be corrupted"
+          fi
+          
           echo "firmware_path=$(pwd)/firmware.zip" >> $GITHUB_ENV
       
-      - name: Extract firmware and fix super.img
+      - name: Extract firmware and process super.img
         run: |
           mkdir -p output && cd output
           unzip -q '${{ env.firmware_path }}'
@@ -80,51 +102,50 @@ jobs:
           if [ -n "$SUPER_IMG" ]; then
             echo "Found super.img: $SUPER_IMG"
             
-            # Convert sparse to raw if needed
+            # Convert sparse to raw
             if file "$SUPER_IMG" | grep -q "sparse"; then
-              echo "Converting sparse super.img to raw..."
+              echo "Converting sparse super.img..."
               simg2img "$SUPER_IMG" super.raw.img
               mv super.raw.img "$SUPER_IMG"
-              echo "Converted successfully"
             fi
             
-            # Extract partitions from super using lpunpack
-            echo "Extracting partitions from super.img..."
+            # Extract partitions
+            echo "Extracting partitions..."
             mkdir -p super_partitions
             cd super_partitions
             
+            # Try lpunpack if available
             if command -v lpunpack &> /dev/null; then
-              lpunpack "../$SUPER_IMG" .
+              echo "Using lpunpack..."
+              lpunpack "../$SUPER_IMG" . || echo "lpunpack failed"
             elif [ -f ~/bin/lpunpack.py ]; then
-              python3 ~/bin/lpunpack.py "../$SUPER_IMG" .
+              echo "Using lpunpack.py..."
+              python3 ~/bin/lpunpack.py "../$SUPER_IMG" . || echo "lpunpack.py failed"
             else
-              echo "lpunpack not available, trying 7z..."
-              7z x "../$SUPER_IMG" || true
+              echo "No lpunpack available, trying 7z..."
+              7z x "../$SUPER_IMG" || echo "7z extraction failed"
             fi
             
-            echo "Extracted partitions:"
+            echo "Partitions found:"
             ls -lah
             
-            # Mount and extract build.prop from each partition
+            # Mount and extract build.prop
             for img in *.img; do
-              if [ -f "$img" ] && [ -s "$img" ]; then
-                mkdir -p "${img%.img}_mnt"
-                sudo mount -o loop "$img" "${img%.img}_mnt" 2>/dev/null && {
-                  echo "Mounted $img"
-                  find "${img%.img}_mnt" -name "build.prop" -exec cp {} "../${img%.img}_build.prop" \; 2>/dev/null
-                  sudo umount "${img%.img}_mnt" 2>/dev/null || true
+              if [ -f "$img" ]; then
+                mkdir -p mnt_tmp
+                sudo mount -o loop "$img" mnt_tmp 2>/dev/null && {
+                  find mnt_tmp -name "build.prop" -exec cp {} "../${img%.img}_build.prop" \\; 2>/dev/null
+                  sudo umount mnt_tmp 2>/dev/null || true
                 }
-                rmdir "${img%.img}_mnt" 2>/dev/null || sudo umount -l "${img%.img}_mnt" 2>/dev/null || true
+                rmdir mnt_tmp 2>/dev/null || true
               fi
             done
             
             cd ..
-          else
-            echo "No super.img found"
           fi
           
-          # Copy extracted partitions back to main output
-          cp -r super_partitions/*.img . 2>/dev/null || true
+          # Copy all extracted partitions to main output
+          cp super_partitions/*.img . 2>/dev/null || true
       
       - name: Run Phoenix dumper
         id: dump
@@ -133,22 +154,34 @@ jobs:
           mkdir -p working
           cp -r ../output/* working/ 2>/dev/null || true
           
-          bash dumper.sh working/ 2>&1 | tee dump.log || true
+          bash dumper.sh working/ 2>&1 | tee dump.log || echo "Dumper finished with warnings"
           
+          # Find output directory
           OUTPUT_DIR=$(find out -maxdepth 1 -type d | grep -v "^out$" | head -1)
           [ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="out/tmp"
-          [ -d "$OUTPUT_DIR" ] || OUTPUT_DIR="../output"
+          
+          if [ ! -d "$OUTPUT_DIR" ] || [ -z "$(ls -A $OUTPUT_DIR 2>/dev/null)" ]; then
+            echo "Phoenix output empty, using manual extraction"
+            OUTPUT_DIR="../output"
+          fi
           
           echo "output_dir=$(realpath $OUTPUT_DIR 2>/dev/null || echo $OUTPUT_DIR)" >> $GITHUB_OUTPUT
           echo "total_size=$(du -sh $OUTPUT_DIR 2>/dev/null | cut -f1 || echo 'unknown')" >> $GITHUB_OUTPUT
+          
+          echo "Final output contents:"
+          ls -la "$OUTPUT_DIR" || true
       
       - name: Create archive
         id: archive
         run: |
           OUTPUT_DIR="${{ steps.dump.outputs.output_dir }}"
           ARCHIVE="${{ env.BRAND }}_${{ env.DEVICE_CODENAME }}_${{ env.FIRMWARE_VERSION }}_dump.tar.gz"
+          
+          echo "Creating archive from: $OUTPUT_DIR"
           tar -czf "$ARCHIVE" -C "$(dirname $OUTPUT_DIR)" "$(basename $OUTPUT_DIR)"
+          
           echo "archive_name=$ARCHIVE" >> $GITHUB_OUTPUT
+          ls -lh "$ARCHIVE"
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -167,8 +200,6 @@ jobs:
             **Version:** ${{ env.FIRMWARE_VERSION }}
             **Size:** ${{ steps.dump.outputs.total_size }}
             **Source:** ${{ env.FIRMWARE_URL }}
-            
-            **Note:** Super.img manually extracted with simg2img + lpunpack
           files: ${{ steps.archive.outputs.archive_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
