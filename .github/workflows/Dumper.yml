@@ -39,25 +39,18 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            python3 python3-pip aria2 unzip p7zip-full \
-            liblz4-tool brotli android-sdk-libsparse-utils \
-            git curl wget file zstd e2fsprogs
+            aria2 unzip p7zip-full \
+            simg2img e2fsprogs \
+            liblz4-tool brotli \
+            git curl file zstd
           
-          # Install partition tools for super.img extraction
-          pip3 install --user protobuf==3.20.3 bsdiff4 six docopt pycryptodome zstandard lz4 brotli
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-          
-          # Download lpunpack and other partition tools from Android SDK
+          # Download lpunpack from reliable source
           mkdir -p ~/bin
           cd ~/bin
-          
-          # Get lpunpack from Android CI/prebuilts
           wget -q https://github.com/northumber/android-partition-tools_prebuilt_binaries/releases/download/v1.0/lpunpack-arm64-v8a -O lpunpack || \
           wget -q https://raw.githubusercontent.com/HemanthJabalpuri/AndroidExplorer/master/lpunpack.py -O lpunpack.py
-          
-          # Alternative: use simg2img and img2simg from android-sdk-libsparse-utils
-          which simg2img || echo "simg2img not found"
-          chmod +x * 2>/dev/null || true
+          chmod +x *
+          echo "$HOME/bin" >> $GITHUB_PATH
       
       - name: Clone Phoenix
         run: |
@@ -68,63 +61,47 @@ jobs:
       - name: Download firmware with aria2
         run: |
           mkdir -p firmware && cd firmware
-          echo "Downloading with aria2..."
           aria2c -x16 -s16 -c -o firmware.zip '${{ env.FIRMWARE_URL }}'
-          
-          # Verify
           ls -lh firmware.zip
           file firmware.zip
-          
-          # Check if it's HTML instead of ZIP
-          if file firmware.zip | grep -q "HTML"; then
-            echo "ERROR: Downloaded file is HTML, not ZIP"
-            head -c 2000 firmware.zip
-            exit 1
-          fi
-          
-          unzip -l firmware.zip | head -30
           echo "firmware_path=$(pwd)/firmware.zip" >> $GITHUB_ENV
       
-      - name: Extract firmware and handle super.img
+      - name: Extract firmware and fix super.img
         run: |
-          mkdir -p output
-          cd output
-          
-          # Extract firmware
+          mkdir -p output && cd output
           unzip -q '${{ env.firmware_path }}'
           
-          echo "Extracted contents:"
+          echo "Extracted files:"
           ls -lah
           
-          # Find super.img
+          # Find and process super.img
           SUPER_IMG=$(find . -name "super.img" -type f | head -1)
           
           if [ -n "$SUPER_IMG" ]; then
             echo "Found super.img: $SUPER_IMG"
             
-            # Check if sparse and convert
+            # Convert sparse to raw if needed
             if file "$SUPER_IMG" | grep -q "sparse"; then
-              echo "Converting sparse super.img..."
+              echo "Converting sparse super.img to raw..."
               simg2img "$SUPER_IMG" super.raw.img
               mv super.raw.img "$SUPER_IMG"
+              echo "Converted successfully"
             fi
             
-            # Extract logical partitions from super
+            # Extract partitions from super using lpunpack
             echo "Extracting partitions from super.img..."
-            mkdir -p super_extracted
-            cd super_extracted
+            mkdir -p super_partitions
+            cd super_partitions
             
-            # Try lpunpack first
             if command -v lpunpack &> /dev/null; then
-              lpunpack "../$SUPER_IMG" || echo "lpunpack failed, trying alternative"
+              lpunpack "../$SUPER_IMG" .
+            elif [ -f ~/bin/lpunpack.py ]; then
+              python3 ~/bin/lpunpack.py "../$SUPER_IMG" .
+            else
+              echo "lpunpack not available, trying 7z..."
+              7z x "../$SUPER_IMG" || true
             fi
             
-            # Alternative: use imjtool if available
-            if [ ! "$(ls -A .)" ] && command -v imjtool &> /dev/null; then
-              imjtool "../$SUPER_IMG" extract
-            fi
-            
-            # Check what we got
             echo "Extracted partitions:"
             ls -lah
             
@@ -132,13 +109,12 @@ jobs:
             for img in *.img; do
               if [ -f "$img" ] && [ -s "$img" ]; then
                 mkdir -p "${img%.img}_mnt"
-                # Try to mount as ext4
                 sudo mount -o loop "$img" "${img%.img}_mnt" 2>/dev/null && {
                   echo "Mounted $img"
                   find "${img%.img}_mnt" -name "build.prop" -exec cp {} "../${img%.img}_build.prop" \; 2>/dev/null
                   sudo umount "${img%.img}_mnt" 2>/dev/null || true
                 }
-                rmdir "${img%.img}_mnt" 2>/dev/null || true
+                rmdir "${img%.img}_mnt" 2>/dev/null || sudo umount -l "${img%.img}_mnt" 2>/dev/null || true
               fi
             done
             
@@ -147,45 +123,32 @@ jobs:
             echo "No super.img found"
           fi
           
-          # List all extracted files
-          echo "All output files:"
-          find . -type f -name "*.img" -o -name "*.bin" -o -name "*.prop" | head -50
+          # Copy extracted partitions back to main output
+          cp -r super_partitions/*.img . 2>/dev/null || true
       
-      - name: Run Phoenix dumper on extracted firmware
+      - name: Run Phoenix dumper
         id: dump
         run: |
           cd phoenix
-          
-          # Create a working directory with the extracted firmware
           mkdir -p working
           cp -r ../output/* working/ 2>/dev/null || true
           
-          # Run dumper on the directory
           bash dumper.sh working/ 2>&1 | tee dump.log || true
           
-          # Find output
           OUTPUT_DIR=$(find out -maxdepth 1 -type d | grep -v "^out$" | head -1)
           [ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="out/tmp"
+          [ -d "$OUTPUT_DIR" ] || OUTPUT_DIR="../output"
           
-          if [ -d "$OUTPUT_DIR" ]; then
-            echo "output_dir=$(realpath $OUTPUT_DIR)" >> $GITHUB_OUTPUT
-            echo "total_size=$(du -sh $OUTPUT_DIR | cut -f1)" >> $GITHUB_OUTPUT
-            ls -la "$OUTPUT_DIR"
-          else
-            # Use our manual extraction as fallback
-            echo "output_dir=$(realpath ../output)" >> $GITHUB_OUTPUT
-            echo "total_size=$(du -sh ../output | cut -f1)" >> $GITHUB_OUTPUT
-          fi
+          echo "output_dir=$(realpath $OUTPUT_DIR 2>/dev/null || echo $OUTPUT_DIR)" >> $GITHUB_OUTPUT
+          echo "total_size=$(du -sh $OUTPUT_DIR 2>/dev/null | cut -f1 || echo 'unknown')" >> $GITHUB_OUTPUT
       
       - name: Create archive
         id: archive
         run: |
           OUTPUT_DIR="${{ steps.dump.outputs.output_dir }}"
           ARCHIVE="${{ env.BRAND }}_${{ env.DEVICE_CODENAME }}_${{ env.FIRMWARE_VERSION }}_dump.tar.gz"
-          
           tar -czf "$ARCHIVE" -C "$(dirname $OUTPUT_DIR)" "$(basename $OUTPUT_DIR)"
           echo "archive_name=$ARCHIVE" >> $GITHUB_OUTPUT
-          ls -lh $ARCHIVE
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -205,7 +168,7 @@ jobs:
             **Size:** ${{ steps.dump.outputs.total_size }}
             **Source:** ${{ env.FIRMWARE_URL }}
             
-            **Note:** Super partition manually extracted with lpunpack/simg2img
+            **Note:** Super.img manually extracted with simg2img + lpunpack
           files: ${{ steps.archive.outputs.archive_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
