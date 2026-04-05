@@ -29,156 +29,184 @@ env:
 jobs:
   dump-and-release:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
       
-      - name: Setup dependencies
+      - name: Install dependencies
         run: |
-          echo "Installing system dependencies..."
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            python3 python3-pip python3-setuptools python3-venv \
-            git curl wget aria2 \
-            unzip p7zip-full p7zip-rar \
-            liblz4-tool brotli \
-            android-sdk-libsparse-utils \
-            libxml2-utils \
-            jq bc file \
-            cpio gzip bzip2 xz-utils \
-            zstd
+            python3 python3-pip aria2 unzip p7zip-full \
+            liblz4-tool brotli android-sdk-libsparse-utils \
+            git curl wget file zstd e2fsprogs
           
-          echo "Installing Python packages from PyPI only..."
-          pip3 install --user --upgrade pip
-          pip3 install --user \
-            protobuf==3.20.3 \
-            bsdiff4 \
-            six \
-            docopt \
-            pycryptodome \
-            zstandard \
-            lz4 \
-            brotli
-          
+          # Install partition tools for super.img extraction
+          pip3 install --user protobuf==3.20.3 bsdiff4 six docopt pycryptodome zstandard lz4 brotli
           echo "$HOME/.local/bin" >> $GITHUB_PATH
-          pip3 list --user
+          
+          # Download lpunpack and other partition tools from Android SDK
+          mkdir -p ~/bin
+          cd ~/bin
+          
+          # Get lpunpack from Android CI/prebuilts
+          wget -q https://github.com/northumber/android-partition-tools_prebuilt_binaries/releases/download/v1.0/lpunpack-arm64-v8a -O lpunpack || \
+          wget -q https://raw.githubusercontent.com/HemanthJabalpuri/AndroidExplorer/master/lpunpack.py -O lpunpack.py
+          
+          # Alternative: use simg2img and img2simg from android-sdk-libsparse-utils
+          which simg2img || echo "simg2img not found"
+          chmod +x * 2>/dev/null || true
       
-      - name: Clone Phoenix Firmware Dumper
+      - name: Clone Phoenix
         run: |
           git clone --depth=1 https://github.com/DroidDumps/phoenix_firmware_dumper.git phoenix
-          cd phoenix
-          chmod +x dumper.sh setup.sh
+          cd phoenix && chmod +x dumper.sh setup.sh
+          bash setup.sh || true
       
-      - name: Run Phoenix setup
+      - name: Download firmware with aria2
         run: |
-          cd phoenix
-          # Run setup but ignore pip errors (we already installed deps)
-          bash setup.sh || echo "Setup completed with warnings"
-      
-      - name: Download firmware
-        run: |
-          mkdir -p firmware
-          cd firmware
-          echo "Downloading from: ${{ env.FIRMWARE_URL }}"
+          mkdir -p firmware && cd firmware
+          echo "Downloading with aria2..."
+          aria2c -x16 -s16 -c -o firmware.zip '${{ env.FIRMWARE_URL }}'
           
-          # Try aria2c first, fallback to wget/curl
-          aria2c -x4 -s4 -c -o firmware.zip '${{ env.FIRMWARE_URL }}' 2>/dev/null || \
-            wget -q --show-progress -c -O firmware.zip '${{ env.FIRMWARE_URL }}' || \
-            curl -L -o firmware.zip '${{ env.FIRMWARE_URL }}'
-          
+          # Verify
           ls -lh firmware.zip
-          echo "firmware_path=$(pwd)/firmware.zip" >> $GITHUB_ENV
-      
-      - name: Dump firmware with Phoenix
-        id: dump
-        run: |
-          cd phoenix
-          echo "Starting dump for ${{ env.BRAND }} ${{ env.DEVICE_CODENAME }}"
+          file firmware.zip
           
-          # Run dumper
-          bash dumper.sh '${{ env.firmware_path }}' 2>&1 | tee dump.log || {
-            echo "Dumper exited with code ${PIPESTATUS[0]}"
-          }
-          
-          # Find output directory
-          OUTPUT_DIR=$(find out -maxdepth 1 -type d | grep -v "^out$" | sort -r | head -n 1)
-          
-          if [ -z "$OUTPUT_DIR" ]; then
-            OUTPUT_DIR=$(find . -maxdepth 2 -type d -name "*${{ env.DEVICE_CODENAME }}*" 2>/dev/null | head -n 1)
-          fi
-          
-          if [ -z "$OUTPUT_DIR" ] || [ ! -d "$OUTPUT_DIR" ]; then
-            echo "Error: No output found"
-            ls -la out/ 2>/dev/null || true
+          # Check if it's HTML instead of ZIP
+          if file firmware.zip | grep -q "HTML"; then
+            echo "ERROR: Downloaded file is HTML, not ZIP"
+            head -c 2000 firmware.zip
             exit 1
           fi
           
-          echo "output_dir=$OUTPUT_DIR" >> $GITHUB_OUTPUT
-          echo "total_size=$(du -sh $OUTPUT_DIR | cut -f1)" >> $GITHUB_OUTPUT
-          find "$OUTPUT_DIR" -type f | head -20
+          unzip -l firmware.zip | head -30
+          echo "firmware_path=$(pwd)/firmware.zip" >> $GITHUB_ENV
       
-      - name: Create release archive
+      - name: Extract firmware and handle super.img
+        run: |
+          mkdir -p output
+          cd output
+          
+          # Extract firmware
+          unzip -q '${{ env.firmware_path }}'
+          
+          echo "Extracted contents:"
+          ls -lah
+          
+          # Find super.img
+          SUPER_IMG=$(find . -name "super.img" -type f | head -1)
+          
+          if [ -n "$SUPER_IMG" ]; then
+            echo "Found super.img: $SUPER_IMG"
+            
+            # Check if sparse and convert
+            if file "$SUPER_IMG" | grep -q "sparse"; then
+              echo "Converting sparse super.img..."
+              simg2img "$SUPER_IMG" super.raw.img
+              mv super.raw.img "$SUPER_IMG"
+            fi
+            
+            # Extract logical partitions from super
+            echo "Extracting partitions from super.img..."
+            mkdir -p super_extracted
+            cd super_extracted
+            
+            # Try lpunpack first
+            if command -v lpunpack &> /dev/null; then
+              lpunpack "../$SUPER_IMG" || echo "lpunpack failed, trying alternative"
+            fi
+            
+            # Alternative: use imjtool if available
+            if [ ! "$(ls -A .)" ] && command -v imjtool &> /dev/null; then
+              imjtool "../$SUPER_IMG" extract
+            fi
+            
+            # Check what we got
+            echo "Extracted partitions:"
+            ls -lah
+            
+            # Mount and extract build.prop from each partition
+            for img in *.img; do
+              if [ -f "$img" ] && [ -s "$img" ]; then
+                mkdir -p "${img%.img}_mnt"
+                # Try to mount as ext4
+                sudo mount -o loop "$img" "${img%.img}_mnt" 2>/dev/null && {
+                  echo "Mounted $img"
+                  find "${img%.img}_mnt" -name "build.prop" -exec cp {} "../${img%.img}_build.prop" \; 2>/dev/null
+                  sudo umount "${img%.img}_mnt" 2>/dev/null || true
+                }
+                rmdir "${img%.img}_mnt" 2>/dev/null || true
+              fi
+            done
+            
+            cd ..
+          else
+            echo "No super.img found"
+          fi
+          
+          # List all extracted files
+          echo "All output files:"
+          find . -type f -name "*.img" -o -name "*.bin" -o -name "*.prop" | head -50
+      
+      - name: Run Phoenix dumper on extracted firmware
+        id: dump
+        run: |
+          cd phoenix
+          
+          # Create a working directory with the extracted firmware
+          mkdir -p working
+          cp -r ../output/* working/ 2>/dev/null || true
+          
+          # Run dumper on the directory
+          bash dumper.sh working/ 2>&1 | tee dump.log || true
+          
+          # Find output
+          OUTPUT_DIR=$(find out -maxdepth 1 -type d | grep -v "^out$" | head -1)
+          [ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="out/tmp"
+          
+          if [ -d "$OUTPUT_DIR" ]; then
+            echo "output_dir=$(realpath $OUTPUT_DIR)" >> $GITHUB_OUTPUT
+            echo "total_size=$(du -sh $OUTPUT_DIR | cut -f1)" >> $GITHUB_OUTPUT
+            ls -la "$OUTPUT_DIR"
+          else
+            # Use our manual extraction as fallback
+            echo "output_dir=$(realpath ../output)" >> $GITHUB_OUTPUT
+            echo "total_size=$(du -sh ../output | cut -f1)" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Create archive
         id: archive
         run: |
           OUTPUT_DIR="${{ steps.dump.outputs.output_dir }}"
-          ARCHIVE_NAME="${{ env.BRAND }}_${{ env.DEVICE_CODENAME }}_${{ env.FIRMWARE_VERSION }}_dump.tar.gz"
+          ARCHIVE="${{ env.BRAND }}_${{ env.DEVICE_CODENAME }}_${{ env.FIRMWARE_VERSION }}_dump.tar.gz"
           
-          echo "Creating $ARCHIVE_NAME from $OUTPUT_DIR"
-          tar -czf "$ARCHIVE_NAME" -C "$(dirname "$OUTPUT_DIR")" "$(basename "$OUTPUT_DIR")"
-          
-          ARCHIVE_BYTES=$(stat -c%s "$ARCHIVE_NAME" 2>/dev/null || echo "0")
-          echo "Size: $(du -h $ARCHIVE_NAME | cut -f1) ($ARCHIVE_BYTES bytes)"
-          
-          # Split if >2GB
-          if [ "$ARCHIVE_BYTES" -gt 2147483648 ]; then
-            echo "File too large, splitting..."
-            split -b 1900M "$ARCHIVE_NAME" "${ARCHIVE_NAME}.part"
-          fi
-          
-          echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
-          echo "archive_path=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+          tar -czf "$ARCHIVE" -C "$(dirname $OUTPUT_DIR)" "$(basename $OUTPUT_DIR)"
+          echo "archive_name=$ARCHIVE" >> $GITHUB_OUTPUT
+          ls -lh $ARCHIVE
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BRAND }}-${{ env.DEVICE_CODENAME }}-dump
-          path: ${{ steps.archive.outputs.archive_path }}*
+          path: ${{ steps.archive.outputs.archive_name }}
           retention-days: 30
-          compression-level: 0
       
-      - name: Create GitHub Release
-        id: create_release
+      - name: Create release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ env.BRAND }}-${{ env.DEVICE_CODENAME }}-${{ env.FIRMWARE_VERSION }}-${{ github.run_number }}
           name: "${{ env.BRAND }} ${{ env.DEVICE_CODENAME }} - ${{ env.FIRMWARE_VERSION }}"
           body: |
-            ## Firmware Dump Details
+            **Device:** ${{ env.BRAND }} ${{ env.DEVICE_CODENAME }}
+            **Version:** ${{ env.FIRMWARE_VERSION }}
+            **Size:** ${{ steps.dump.outputs.total_size }}
+            **Source:** ${{ env.FIRMWARE_URL }}
             
-            | Property | Value |
-            |----------|-------|
-            | **Brand** | ${{ env.BRAND }} |
-            | **Device** | ${{ env.DEVICE_CODENAME }} |
-            | **Version** | ${{ env.FIRMWARE_VERSION }} |
-            | **Platform** | MT6768 |
-            | **Dump Size** | ${{ steps.dump.outputs.total_size }} |
-            
-            ### Contents
-            - Boot images (boot_a, boot_b)
-            - DTB/Dtbo images
-            - Super partition (system, vendor, product)
-            - Preloader, Modem, TEE images
-            - VBMeta, Vendor boot
-            
-            ### Source
-            - **URL:** ${{ env.FIRMWARE_URL }}
-            - **Tool:** Phoenix Firmware Dumper
-            
-            - A/B partitions, Dynamic partitions
-          files: ${{ steps.archive.outputs.archive_path }}*
-          fail_on_unmatched_files: false
+            **Note:** Super partition manually extracted with lpunpack/simg2img
+          files: ${{ steps.archive.outputs.archive_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           
