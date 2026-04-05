@@ -1,4 +1,4 @@
-name: Phoenix Firmware Dumper & Release
+name: Phoenix Firmware Dumper & Repo Creator
 
 on:
   workflow_dispatch:
@@ -19,15 +19,24 @@ on:
         description: 'Firmware version/tag'
         required: true
         default: 'Hot-10i-04'
+      repo_visibility:
+        description: 'Repository visibility'
+        required: true
+        default: 'public'
+        type: choice
+        options:
+          - public
+          - private
 
 env:
-  FIRMWARE_URL: ${{ github.event.inputs.firmware_url || 'https://archive.org/download/infinix-hot-10i-x-659-b-04/Infinix-Hot-10i-X659B-04.zip' }}
-  DEVICE_CODENAME: ${{ github.event.inputs.device_codename || 'X659B' }}
-  BRAND: ${{ github.event.inputs.brand || 'Infinix' }}
-  FIRMWARE_VERSION: ${{ github.event.inputs.firmware_version || 'Hot-10i-04' }}
+  FIRMWARE_URL: ${{ github.event.inputs.firmware_url }}
+  DEVICE_CODENAME: ${{ github.event.inputs.device_codename }}
+  BRAND: ${{ github.event.inputs.brand }}
+  FIRMWARE_VERSION: ${{ github.event.inputs.firmware_version }}
+  REPO_VISIBILITY: ${{ github.event.inputs.repo_visibility }}
 
 jobs:
-  dump-and-release:
+  dump-and-create-repo:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
     
@@ -42,27 +51,26 @@ jobs:
             aria2 unzip p7zip-full \
             simg2img e2fsprogs \
             liblz4-tool brotli \
-            git curl file zstd
+            git curl file zstd gh
+      
+      - name: Setup GitHub CLI authentication
+        run: |
+          echo "${{ secrets.GH_PAT }}" | gh auth login --with-token
+          gh auth status
       
       - name: Download lpunpack tool
         run: |
           mkdir -p ~/bin
           cd ~/bin
           
-          # Try multiple sources for lpunpack
           echo "Downloading lpunpack..."
-          
-          # Option 1: Prebuilt binary
           wget -q https://github.com/northumber/android-partition-tools_prebuilt_binaries/releases/download/v1.0/lpunpack-arm64-v8a -O lpunpack 2>/dev/null || \
-          # Option 2: Python script
           wget -q https://raw.githubusercontent.com/HemanthJabalpuri/AndroidExplorer/master/lpunpack.py -O lpunpack.py 2>/dev/null || \
-          # Option 3: Build from AOSP
           (git clone --depth=1 https://android.googlesource.com/platform/system/extras lpunpack_src 2>/dev/null && \
            cd lpunpack_src/partition_tools && gcc -o lpunpack lpunpack.c 2>/dev/null) || \
           echo "WARNING: Could not download lpunpack, will use alternative methods"
           
           chmod +x * 2>/dev/null || true
-          ls -la ~/bin/ || echo "bin directory empty"
           echo "$HOME/bin" >> $GITHUB_PATH
         continue-on-error: true
       
@@ -81,7 +89,6 @@ jobs:
           ls -lh firmware.zip
           file firmware.zip
           
-          # Verify it's actually a zip
           if ! unzip -t firmware.zip 2>&1 | head -5; then
             echo "WARNING: ZIP test failed, file may be corrupted"
           fi
@@ -96,25 +103,20 @@ jobs:
           echo "Extracted files:"
           ls -lah
           
-          # Find and process super.img
           SUPER_IMG=$(find . -name "super.img" -type f | head -1)
           
           if [ -n "$SUPER_IMG" ]; then
             echo "Found super.img: $SUPER_IMG"
             
-            # Convert sparse to raw
             if file "$SUPER_IMG" | grep -q "sparse"; then
               echo "Converting sparse super.img..."
               simg2img "$SUPER_IMG" super.raw.img
               mv super.raw.img "$SUPER_IMG"
             fi
             
-            # Extract partitions
-            echo "Extracting partitions..."
             mkdir -p super_partitions
             cd super_partitions
             
-            # Try lpunpack if available
             if command -v lpunpack &> /dev/null; then
               echo "Using lpunpack..."
               lpunpack "../$SUPER_IMG" . || echo "lpunpack failed"
@@ -129,12 +131,11 @@ jobs:
             echo "Partitions found:"
             ls -lah
             
-            # Mount and extract build.prop
             for img in *.img; do
               if [ -f "$img" ]; then
                 mkdir -p mnt_tmp
                 sudo mount -o loop "$img" mnt_tmp 2>/dev/null && {
-                  find mnt_tmp -name "build.prop" -exec cp {} "../${img%.img}_build.prop" \\; 2>/dev/null
+                  find mnt_tmp -name "build.prop" -exec cp {} "../${img%.img}_build.prop" \; 2>/dev/null
                   sudo umount mnt_tmp 2>/dev/null || true
                 }
                 rmdir mnt_tmp 2>/dev/null || true
@@ -144,7 +145,6 @@ jobs:
             cd ..
           fi
           
-          # Copy all extracted partitions to main output
           cp super_partitions/*.img . 2>/dev/null || true
       
       - name: Run Phoenix dumper
@@ -156,7 +156,6 @@ jobs:
           
           bash dumper.sh working/ 2>&1 | tee dump.log || echo "Dumper finished with warnings"
           
-          # Find output directory
           OUTPUT_DIR=$(find out -maxdepth 1 -type d | grep -v "^out$" | head -1)
           [ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="out/tmp"
           
@@ -171,36 +170,144 @@ jobs:
           echo "Final output contents:"
           ls -la "$OUTPUT_DIR" || true
       
-      - name: Create archive
-        id: archive
+      - name: Generate repository name
+        id: repo_name
+        run: |
+          # Sanitize names for valid GitHub repo names
+          REPO_NAME=$(echo "${{ env.BRAND }}-${{ env.DEVICE_CODENAME }}-${{ env.FIRMWARE_VERSION }}" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-._' | cut -c1-100)
+          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+          echo "Repository name will be: $REPO_NAME"
+      
+      - name: Create new GitHub repository
+        id: create_repo
+        run: |
+          REPO_NAME="${{ steps.repo_name.outputs.repo_name }}"
+          VISIBILITY="${{ env.REPO_VISIBILITY }}"
+          
+          echo "Creating repository: $REPO_NAME (visibility: $VISIBILITY)"
+          
+          # Check if repo already exists
+          if gh repo view "${{ github.repository_owner }}/$REPO_NAME" &>/dev/null; then
+            echo "Repository already exists, will push to existing repo"
+            echo "repo_url=https://github.com/${{ github.repository_owner }}/$REPO_NAME" >> $GITHUB_OUTPUT
+            echo "repo_exists=true" >> $GITHUB_OUTPUT
+          else
+            # Create new repository using gh cli [^14^][^16^]
+            gh repo create "$REPO_NAME" \
+              --$VISIBILITY \
+              --description "${{ env.BRAND }} ${{ env.DEVICE_CODENAME }} firmware dump - ${{ env.FIRMWARE_VERSION }}" \
+              --enable-issues=true \
+              --enable-wiki=false
+            
+            echo "repo_url=https://github.com/${{ github.repository_owner }}/$REPO_NAME" >> $GITHUB_OUTPUT
+            echo "repo_exists=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Prepare repository content
         run: |
           OUTPUT_DIR="${{ steps.dump.outputs.output_dir }}"
-          ARCHIVE="${{ env.BRAND }}_${{ env.DEVICE_CODENAME }}_${{ env.FIRMWARE_VERSION }}_dump.tar.gz"
+          REPO_NAME="${{ steps.repo_name.outputs.repo_name }}"
           
-          echo "Creating archive from: $OUTPUT_DIR"
-          tar -czf "$ARCHIVE" -C "$(dirname $OUTPUT_DIR)" "$(basename $OUTPUT_DIR)"
+          # Create a clean directory for the new repo
+          mkdir -p new_repo_content
+          cd new_repo_content
           
-          echo "archive_name=$ARCHIVE" >> $GITHUB_OUTPUT
-          ls -lh "$ARCHIVE"
+          # Copy all dump files
+          cp -r "$OUTPUT_DIR"/* . 2>/dev/null || true
+          
+          # Create README.md
+          cat > README.md << 'EOF'
+          # ${{ env.BRAND }} ${{ env.DEVICE_CODENAME }} - ${{ env.FIRMWARE_VERSION }}
+          
+          **Firmware Dump Details:**
+          | Property | Value |
+          |----------|-------|
+          | **Brand** | ${{ env.BRAND }} |
+          | **Device** | ${{ env.DEVICE_CODENAME }} |
+          | **Version** | ${{ env.FIRMWARE_VERSION }} |
+          | **Source** | ${{ env.FIRMWARE_URL }} |
+          | **Dump Size** | ${{ steps.dump.outputs.total_size }} |
+          | **Dump Date** | $(date -u +"%Y-%m-%d %H:%M:%S UTC") |
+          | **Workflow Run** | ${{ github.run_id }} |
+          
+          ## Contents
+          - Partition images (`.img` files)
+          - Build.prop extracts
+          - Firmware metadata
+          
+          ## Verification
+          Generated by [Phoenix Firmware Dumper](https://github.com/DroidDumps/phoenix_firmware_dumper)
+          EOF
+          
+          # Create .gitattributes for large files
+          cat > .gitattributes << 'EOF'
+          *.img filter=lfs diff=lfs merge=lfs -text
+          *.zip filter=lfs diff=lfs merge=lfs -text
+          *.tar.gz filter=lfs diff=lfs merge=lfs -text
+          *.raw filter=lfs diff=lfs merge=lfs -text
+          EOF
+          
+          # Create metadata file
+          cat > firmware-info.json << EOF
+          {
+            "brand": "${{ env.BRAND }}",
+            "device": "${{ env.DEVICE_CODENAME }}",
+            "version": "${{ env.FIRMWARE_VERSION }}",
+            "source_url": "${{ env.FIRMWARE_URL }}",
+            "dump_size": "${{ steps.dump.outputs.total_size }}",
+            "dump_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "workflow_run": "${{ github.run_id }}",
+            "repository": "${{ github.repository }}"
+          }
+          EOF
       
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.BRAND }}-${{ env.DEVICE_CODENAME }}-dump
-          path: ${{ steps.archive.outputs.archive_name }}
-          retention-days: 30
+      - name: Initialize and push to new repository
+        run: |
+          REPO_NAME="${{ steps.repo_name.outputs.repo_name }}"
+          REPO_URL="${{ steps.create_repo.outputs.repo_url }}"
+          OUTPUT_DIR="${{ steps.dump.outputs.output_dir }}"
+          
+          cd new_repo_content
+          
+          # Initialize git repo
+          git init
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          
+          # Add remote with PAT for authentication [^17^]
+          git remote add origin "https://${{ secrets.GH_PAT }}@github.com/${{ github.repository_owner }}/$REPO_NAME.git"
+          
+          # Setup Git LFS for large files (optional but recommended)
+          git lfs track "*.img" 2>/dev/null || true
+          git lfs track "*.zip" 2>/dev/null || true
+          
+          # Add all files
+          git add .
+          
+          # Commit
+          git commit -m "Initial firmware dump: ${{ env.BRAND }} ${{ env.DEVICE_CODENAME }} ${{ env.FIRMWARE_VERSION }}
+          
+          Source: ${{ env.FIRMWARE_URL }}
+          Size: ${{ steps.dump.outputs.total_size }}
+          Workflow: ${{ github.run_id }}"
+          
+          # Push to main branch
+          git branch -M main
+          git push -u origin main --force
       
-      - name: Create release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ env.BRAND }}-${{ env.DEVICE_CODENAME }}-${{ env.FIRMWARE_VERSION }}-${{ github.run_number }}
-          name: "${{ env.BRAND }} ${{ env.DEVICE_CODENAME }} - ${{ env.FIRMWARE_VERSION }}"
-          body: |
-            **Device:** ${{ env.BRAND }} ${{ env.DEVICE_CODENAME }}
-            **Version:** ${{ env.FIRMWARE_VERSION }}
-            **Size:** ${{ steps.dump.outputs.total_size }}
-            **Source:** ${{ env.FIRMWARE_URL }}
-          files: ${{ steps.archive.outputs.archive_name }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create summary comment
+        run: |
+          echo "## ✅ Firmware Dump Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository Created:** ${{ steps.create_repo.outputs.repo_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Detail | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Brand** | ${{ env.BRAND }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Device** | ${{ env.DEVICE_CODENAME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Version** | ${{ env.FIRMWARE_VERSION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Size** | ${{ steps.dump.outputs.total_size }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Visibility** | ${{ env.REPO_VISIBILITY }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "[View Repository](${{ steps.create_repo.outputs.repo_url }})" >> $GITHUB_STEP_SUMMARY
           
